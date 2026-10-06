@@ -6,8 +6,26 @@ import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
   document: WorkspaceDocument | null = null;
+  pending: { document: WorkspaceDocument; savedAt: number } | null = null;
+  failNextSave: Error | null = null;
+  failLocal = false;
   async load() { return this.document ? structuredClone(this.document) : null; }
-  async save(document: WorkspaceDocument) { this.document = structuredClone(document); }
+  async save(document: WorkspaceDocument) {
+    if (this.failNextSave) {
+      const error = this.failNextSave;
+      this.failNextSave = null;
+      throw error;
+    }
+    this.document = structuredClone(document);
+  }
+  saveLocal(document: WorkspaceDocument) {
+    if (this.failLocal) return false;
+    this.document = structuredClone(document);
+    return true;
+  }
+  loadPending() { return this.pending ? structuredClone(this.pending) : null; }
+  stashPending(document: WorkspaceDocument) { this.pending = { document: structuredClone(document), savedAt: Date.now() }; return true; }
+  clearPending() { this.pending = null; }
 }
 
 class FakeChecker {
@@ -100,5 +118,100 @@ describe('RuleWorkspaceViewModel', () => {
     expect(workspace.getSnapshot().workspace?.projects).toHaveLength(2);
     expect(workspace.getSnapshot().project?.fields).toHaveLength(3);
     workspace.dispose();
+  });
+
+  it('flushes unsaved changes synchronously on unload instead of waiting for the debounce', async () => {
+    const repository = new MemoryRepository();
+    const workspace = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(250);
+    const savedTitle = repository.document?.projects[0].title;
+
+    const current = workspace.getSnapshot().project as RuleProject;
+    workspace.commitProject({ ...current, title: '离开前的最后修改' }, '测试编辑', { recheck: false });
+    // The page hides before the 220ms debounce fires: the pending edit must still be written.
+    workspace.flushSync();
+    expect(repository.document?.projects[0].title).toBe('离开前的最后修改');
+    expect(repository.document?.projects[0].title).not.toBe(savedTitle);
+
+    // A second flush with nothing new to write is a no-op and must not throw.
+    workspace.flushSync();
+    workspace.dispose();
+  });
+
+  it('retains the document in the pending slot when saving fails and clears it after a retry', async () => {
+    const repository = new MemoryRepository();
+    const workspace = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await workspace.start();
+    await vi.advanceTimersByTimeAsync(250);
+
+    const current = workspace.getSnapshot().project as RuleProject;
+    repository.failNextSave = new Error('存储已满');
+    workspace.commitProject({ ...current, title: '写不进去的修改' }, '测试编辑', { recheck: false });
+    await vi.advanceTimersByTimeAsync(250);
+    await workspace.flushSave();
+
+    expect(workspace.getSnapshot().persistence).toBe('error');
+    expect(workspace.getSnapshot().saveError).toBe('存储已满');
+    expect(workspace.getSnapshot().pendingRetained).toBe(true);
+    expect(repository.pending?.document.projects[0].title).toBe('写不进去的修改');
+    expect(repository.document?.projects[0].title).not.toBe('写不进去的修改');
+
+    await workspace.retrySave();
+    expect(workspace.getSnapshot().persistence).toBe('saved');
+    expect(workspace.getSnapshot().pendingRetained).toBeUndefined();
+    expect(repository.pending).toBeNull();
+    expect(repository.document?.projects[0].title).toBe('写不进去的修改');
+    workspace.dispose();
+  });
+
+  it('recovers a newer pending document on start and re-saves it', async () => {
+    const repository = new MemoryRepository();
+    const first = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await first.start();
+    await vi.advanceTimersByTimeAsync(250);
+    const current = first.getSnapshot().project as RuleProject;
+    first.commitProject({ ...current, title: '没来得及保存的标题' }, '测试编辑', { recheck: false });
+    // Storage breaks right as the page unloads: the edit only survives in the pending slot.
+    repository.failLocal = true;
+    first.flushSync();
+    expect(repository.document?.projects[0].title).not.toBe('没来得及保存的标题');
+    expect(repository.pending?.document.projects[0].title).toBe('没来得及保存的标题');
+    first.dispose();
+    repository.failLocal = false;
+
+    const restored = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await restored.start();
+    expect(restored.getSnapshot().project?.title).toBe('没来得及保存的标题');
+    expect(restored.getSnapshot().notice).toContain('已恢复上次未能保存的更改');
+    await vi.advanceTimersByTimeAsync(250);
+    await restored.flushSave();
+    expect(restored.getSnapshot().persistence).toBe('saved');
+    expect(repository.pending).toBeNull();
+    expect(repository.document?.projects[0].title).toBe('没来得及保存的标题');
+    restored.dispose();
+  });
+
+  it('drops a stale pending record instead of rolling back newer saved content', async () => {
+    const repository = new MemoryRepository();
+    const first = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await first.start();
+    await vi.advanceTimersByTimeAsync(250);
+    const current = first.getSnapshot().project as RuleProject;
+    first.commitProject({ ...current, title: '较新的已保存标题' }, '测试编辑', { recheck: false });
+    await vi.advanceTimersByTimeAsync(250);
+    await first.flushSave();
+    first.dispose();
+
+    // A leftover pending record from an older revision must not win over the saved copy.
+    const stale = structuredClone(repository.document) as WorkspaceDocument;
+    stale.projects[0] = { ...stale.projects[0], title: '过时的待写内容', updatedAt: 1 };
+    repository.pending = { document: stale, savedAt: Date.now() };
+
+    const restored = new RuleWorkspaceViewModel(repository, new FakeChecker());
+    await restored.start();
+    expect(restored.getSnapshot().project?.title).toBe('较新的已保存标题');
+    expect(repository.pending).toBeNull();
+    restored.dispose();
   });
 });

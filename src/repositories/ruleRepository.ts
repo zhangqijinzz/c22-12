@@ -6,13 +6,40 @@ export class RuleRepository {
   constructor(private readonly storage: ProjectStorageService) {}
 
   async load(): Promise<WorkspaceDocument | null> {
-    const indexedDbValue = await this.storage.read();
-    return decodeWorkspace(indexedDbValue) ?? decodeWorkspace(this.storage.readFallback());
+    // The unload handler commits synchronously to the local fallback only, so the two
+    // stores can diverge; the fresher copy wins instead of always preferring IndexedDB.
+    const primary = decodeWorkspace(await this.storage.readPrimary());
+    const fallback = decodeWorkspace(this.storage.readFallback());
+    if (primary && fallback) return workspaceTimestamp(fallback) > workspaceTimestamp(primary) ? fallback : primary;
+    return primary ?? fallback;
   }
 
   save(document: WorkspaceDocument): Promise<void> {
     return this.storage.write(document);
   }
+
+  saveLocal(document: WorkspaceDocument): boolean {
+    return this.storage.writeLocal(document);
+  }
+
+  loadPending(): { document: WorkspaceDocument; savedAt: number } | null {
+    const record = this.storage.readPending();
+    if (!record) return null;
+    const document = decodeWorkspace(record.document);
+    return document ? { document, savedAt: record.savedAt } : null;
+  }
+
+  stashPending(document: WorkspaceDocument, reason: string): boolean {
+    return this.storage.writePending(document, reason);
+  }
+
+  clearPending(): void {
+    this.storage.clearPending();
+  }
+}
+
+export function workspaceTimestamp(document: WorkspaceDocument): number {
+  return document.projects.reduce((latest, project) => Math.max(latest, project.updatedAt), 0);
 }
 
 function decodeWorkspace(value: unknown): WorkspaceDocument | null {

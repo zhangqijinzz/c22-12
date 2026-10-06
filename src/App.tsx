@@ -5,6 +5,7 @@ import { RulesView } from './features/rules/RulesView';
 import { SamplesView } from './features/samples/SamplesView';
 import { InspectionView } from './features/inspection/InspectionView';
 import { createRuleWeaveViewModels } from './viewmodels/createRuleWeaveViewModels';
+import type { WorkspaceState } from './viewmodels/workspaceViewModel';
 import './styles.css';
 
 const navigation: { id: ModuleId; label: string; description: string; icon: string; step: string }[] = [
@@ -13,6 +14,14 @@ const navigation: { id: ModuleId; label: string; description: string; icon: stri
   { id: 'samples', label: '样例试验区', description: '单点命中推演', icon: '◉', step: '03' },
   { id: 'inspection', label: '检查与版本', description: '覆盖、冲突与快照', icon: '⌕', step: '04' },
 ];
+
+const formatClock = (timestamp: number) => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(timestamp);
+
+function saveIndicatorText(state: WorkspaceState): string {
+  if (state.persistence === 'saving') return '保存中…';
+  if (state.persistence === 'error') return '保存失败';
+  return state.lastSavedAt ? `已保存 ${formatClock(state.lastSavedAt)}` : '已保存';
+}
 
 export default function App() {
   const [viewModels] = useState(createRuleWeaveViewModels);
@@ -44,10 +53,11 @@ export default function App() {
       </aside>
 
       <main className="main-area">
-        <header className="topbar"><div className="breadcrumb"><span>规则项目</span><b>/</b><strong>{activeNavigation.label}</strong></div><div className="topbar-right"><span className="save-indicator"><i className={state.persistence === 'saving' ? 'save-dot is-saving' : state.persistence === 'error' ? 'save-dot save-error' : 'save-dot'} />{state.persistence === 'saving' ? '保存中' : state.persistence === 'error' ? '保存失败' : '已保存'}</span><span className="topbar-divider" /><button className="avatar-button" aria-label="用户菜单">RW</button></div></header>
+        <header className="topbar"><div className="breadcrumb"><span>规则项目</span><b>/</b><strong>{activeNavigation.label}</strong></div><div className="topbar-right"><span className="save-indicator"><i className={state.persistence === 'saving' ? 'save-dot is-saving' : state.persistence === 'error' ? 'save-dot save-error' : 'save-dot'} />{saveIndicatorText(state)}</span><span className="topbar-divider" /><button className="avatar-button" aria-label="用户菜单">RW</button></div></header>
+        {state.persistence === 'error' && <div className="save-alert" role="alert"><strong>更改尚未保存</strong><span>{state.saveError || '写入本地存储失败'}。{state.pendingRetained ? '未保存的内容已保留在本地待写区，重新打开页面时会自动恢复。' : '浏览器存储不可用，未保存的内容仅保留在当前页面中，请勿关闭或刷新。'}</span><button type="button" onClick={() => void workspace.retrySave()}>重试保存</button></div>}
         {project && <div className="content-wrap">
           <div className="project-title-bar"><div className="project-title-copy"><span className="project-kicker">RULE PROJECT / LOCAL</span><input aria-label="项目名称" value={project.title} onChange={(event) => workspace.renameProject(event.target.value)} /><span className="project-subtitle">规则逻辑空间 <span>·</span> 最后修改 {new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(project.updatedAt)}</span></div><div className="title-bar-actions"><span className={`phase-badge phase-${state.phase}`}>{state.phase === 'checking' ? '检查中' : state.phase === 'validating' ? '需要修复' : state.phase === 'error' ? '发生错误' : project.frozenVersionId ? '已冻结' : state.phase === 'ready' ? '检查通过' : '编辑中'}</span><button className="title-more-button" aria-label="创建项目" title="新建项目" onClick={() => workspace.createProject()}>＋</button></div></div>
-          {state.notice && <div className={`status-message${state.phase === 'error' ? ' status-message-error' : ''}`} role="status"><span>{state.phase === 'error' ? '!' : '↳'}</span>{state.notice}{state.saveError && <small>{state.saveError}</small>}</div>}
+          {state.notice && <div className={`status-message${state.phase === 'error' ? ' status-message-error' : ''}`} role="status"><span>{state.phase === 'error' ? '!' : '↳'}</span>{state.notice}</div>}
           <div className="module-tabs" role="tablist" aria-label="规则项目功能模块">
             {navigation.map((item, index) => <button id={`module-tab-${item.id}`} key={item.id} role="tab" aria-selected={state.activeModule === item.id} aria-controls="module-panel" tabIndex={state.activeModule === item.id ? 0 : -1} className={`module-tab${state.activeModule === item.id ? ' module-tab-active' : ''}`} onClick={() => workspace.navigate(item.id)} onKeyDown={(event) => {
               if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;

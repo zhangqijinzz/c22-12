@@ -80,6 +80,11 @@ button:disabled { cursor: not-allowed !important; opacity: .5; }
 .save-dot { width: 5px; height: 5px; box-shadow: none; }
 .save-dot.is-saving { background: #d8a851; animation: pulse 1s infinite alternate; }
 .save-dot.save-error { background: #d66d62; }
+.save-alert { display: flex; align-items: center; gap: 12px; margin: 14px 42px 0; padding: 10px 14px; border: 1px solid #ecc9c4; border-radius: 10px; background: #fdf3f1; }
+.save-alert strong { color: #a34a40; font-size: 11px; white-space: nowrap; }
+.save-alert span { flex: 1; color: #96655f; font-size: 10px; line-height: 1.6; }
+.save-alert button { padding: 5px 14px; border: 1px solid #d9a49d; border-radius: 7px; background: #fff; color: #a34a40; font-size: 10px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+.save-alert button:hover { background: #f9e9e6; border-color: #c98880; }
 .topbar-divider { height: 19px; width: 1px; background: #e4ebe8; }
 .avatar-button { width: 29px; height: 29px; border: 1px solid #cce1d6; border-radius: 50%; background: #eaf4ed; color: #34745e; font: 700 8px Manrope, sans-serif; cursor: default; }
 .content-wrap { width: min(1150px, 100%); margin: 0 auto; padding: 27px 42px 64px; }

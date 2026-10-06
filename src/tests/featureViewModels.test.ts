@@ -7,6 +7,10 @@ import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
 class MemoryRepository {
   async load() { return null; }
   async save() { return undefined; }
+  saveLocal() { return true; }
+  loadPending() { return null; }
+  stashPending() { return true; }
+  clearPending() { return undefined; }
 }
 
 class FakeChecker {

@@ -8,7 +8,7 @@ import type {
   WorkspaceDocument,
 } from '../models/ruleModel';
 import { cloneData, createBlankProject, createDemoWorkspace, createVersionSnapshot, makeId } from '../models/projectFactory';
-import { RuleRepository } from '../repositories/ruleRepository';
+import { RuleRepository, workspaceTimestamp } from '../repositories/ruleRepository';
 import { ProjectStorageService } from '../services/projectStorageService';
 import { RuleCheckService, type CheckOperation } from '../services/ruleCheckService';
 import type { WorkspacePort } from './workspacePort';
@@ -29,10 +29,12 @@ export interface WorkspaceState {
   selectedRuleId?: string;
   notice: string;
   saveError?: string;
+  pendingRetained?: boolean;
+  lastSavedAt?: number;
 }
 
 type Listener = () => void;
-type WorkspaceRepository = Pick<RuleRepository, 'load' | 'save'>;
+type WorkspaceRepository = Pick<RuleRepository, 'load' | 'save' | 'saveLocal' | 'loadPending' | 'stashPending' | 'clearPending'>;
 type Checker = Pick<RuleCheckService, 'run'>;
 
 export class RuleWorkspaceViewModel implements WorkspacePort {
@@ -48,7 +50,9 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   private checkOperation?: CheckOperation;
   private checkRevision = 0;
   private saveRevision = 0;
+  private persistedRevision = 0;
   private writeQueue: Promise<void> = Promise.resolve();
+  private removeUnloadListeners?: () => void;
 
   constructor(
     private readonly repository: WorkspaceRepository = new RuleRepository(new ProjectStorageService()),
@@ -77,11 +81,45 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     await this.writeQueue;
   }
 
+  // Synchronous flush for page unload: async IndexedDB commits are not guaranteed to
+  // finish once the page starts unloading, so the latest document goes to the local
+  // fallback store directly. If even that fails, the document is stashed in the pending
+  // slot so the next start can recover it instead of silently losing the edits.
+  flushSync(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    const workspace = this.state.workspace;
+    if (!workspace || this.saveRevision === this.persistedRevision) return;
+    if (this.repository.saveLocal(workspace)) {
+      this.persistedRevision = this.saveRevision;
+      this.repository.clearPending();
+    } else {
+      this.repository.stashPending(workspace, '页面关闭前保存失败');
+    }
+  }
+
+  async retrySave(): Promise<void> {
+    const workspace = this.state.workspace;
+    if (!workspace) return;
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    this.publish({ ...this.state, persistence: 'saving', saveError: undefined });
+    this.enqueueSave(workspace, ++this.saveRevision);
+    await this.writeQueue;
+  }
+
   dispose(): void {
+    this.flushSync();
     if (this.saveTimer) clearTimeout(this.saveTimer);
     if (this.checkTimer) clearTimeout(this.checkTimer);
     this.checkOperation?.cancel();
     this.checkOperation = undefined;
+    this.removeUnloadListeners?.();
+    this.removeUnloadListeners = undefined;
   }
 
   commitProject(project: RuleProject, notice = '项目已更新', options: { recheck?: boolean } = {}): boolean {
@@ -216,13 +254,28 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
 
   private async initialize(): Promise<void> {
     this.publish({ ...this.state, phase: 'loading', notice: '正在恢复本地规则项目…' });
+    this.registerUnloadListeners();
     try {
       const saved = await this.repository.load();
-      const workspace = saved ?? createDemoWorkspace();
+      const pending = this.repository.loadPending();
+      let workspace = saved ?? createDemoWorkspace();
+      let recovered = false;
+      if (pending) {
+        if (!saved || workspaceTimestamp(pending.document) > workspaceTimestamp(saved)) {
+          // The pending copy holds edits that never reached the main stores.
+          workspace = pending.document;
+          recovered = true;
+        } else {
+          this.repository.clearPending();
+        }
+      }
       const project = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId) ?? workspace.projects[0];
       const issues = ruleDomain.validateProject(project);
-      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则' });
-      if (saved) this.scheduleCheck(40);
+      const notice = recovered
+        ? `已恢复上次未能保存的更改（${new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(pending?.savedAt ?? Date.now())}留存），正在重新保存…`
+        : saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则';
+      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved && !recovered ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice });
+      if (saved && !recovered) this.scheduleCheck(40);
       else {
         this.scheduleSave(workspace);
         if (!issues.length) this.scheduleCheck(40);
@@ -230,6 +283,20 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     } catch (error) {
       this.publish({ ...this.state, phase: 'error', notice: error instanceof Error ? error.message : '项目初始化失败' });
     }
+  }
+
+  private registerUnloadListeners(): void {
+    if (this.removeUnloadListeners || typeof window === 'undefined' || typeof document === 'undefined') return;
+    const flush = () => this.flushSync();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    this.removeUnloadListeners = () => {
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }
 
   private replaceProject(project: RuleProject, notice: string, recheck: boolean, allowFrozen = false): void {
@@ -287,9 +354,18 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
 
   private enqueueSave(workspace: WorkspaceDocument, revision: number): void {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(() => this.repository.save(workspace)).then(() => {
-      if (revision === this.saveRevision) this.publish({ ...this.state, persistence: 'saved', saveError: undefined });
+      if (revision > this.persistedRevision) this.persistedRevision = revision;
+      if (revision === this.saveRevision) {
+        this.repository.clearPending();
+        this.publish({ ...this.state, persistence: 'saved', saveError: undefined, pendingRetained: undefined, lastSavedAt: Date.now() });
+      }
     }).catch((error: unknown) => {
-      if (revision === this.saveRevision) this.publish({ ...this.state, persistence: 'error', saveError: error instanceof Error ? error.message : '保存失败' });
+      if (revision === this.saveRevision) {
+        const message = error instanceof Error ? error.message : '保存失败';
+        // Keep the latest document in the pending slot so the edits survive a reload.
+        const retained = this.state.workspace ? this.repository.stashPending(this.state.workspace, message) : false;
+        this.publish({ ...this.state, persistence: 'error', saveError: message, pendingRetained: retained });
+      }
     });
   }
 
