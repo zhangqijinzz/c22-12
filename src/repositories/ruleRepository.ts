@@ -1,18 +1,77 @@
 import type { BusinessRule, RuleField, RuleProject, RuleVersion, WorkspaceDocument } from '../models/ruleModel';
 import { defaultSample } from '../domain/conditionEvaluator';
-import { ProjectStorageService } from '../services/projectStorageService';
+import type { WorkspaceStorage } from '../services/projectStorageService';
+
+export interface WorkspaceLoadResult {
+  document: WorkspaceDocument | null;
+  recoveredPending: boolean;
+  lostUnsavedChanges: boolean;
+}
 
 export class RuleRepository {
-  constructor(private readonly storage: ProjectStorageService) {}
+  constructor(private readonly storage: WorkspaceStorage) {}
 
-  async load(): Promise<WorkspaceDocument | null> {
-    const indexedDbValue = await this.storage.read();
-    return decodeWorkspace(indexedDbValue) ?? decodeWorkspace(this.storage.readFallback());
+  async load(): Promise<WorkspaceLoadResult> {
+    const primary = decodeWorkspace(await this.storage.readPrimary());
+    const fallback = decodeWorkspace(this.storage.readFallback());
+    let document = newerDocument(primary, fallback);
+    let recoveredPending = false;
+
+    const pending = this.storage.readPending();
+    const pendingDocument = pending ? decodeWorkspace(pending.document) : null;
+    if (pendingDocument && (!document || maxProjectUpdatedAt(pendingDocument) > maxProjectUpdatedAt(document))) {
+      // A previous save never reached durable storage; surface the retained copy instead.
+      document = pendingDocument;
+      recoveredPending = true;
+    } else if (pending) {
+      this.storage.clearPending();
+    }
+
+    let lostUnsavedChanges = false;
+    const dirty = this.storage.readDirty();
+    if (dirty && document) {
+      const project = document.projects.find((candidate) => candidate.id === dirty.projectId);
+      lostUnsavedChanges = !project || project.updatedAt < dirty.updatedAt;
+    }
+    this.storage.clearDirty();
+
+    return { document, recoveredPending, lostUnsavedChanges };
   }
 
-  save(document: WorkspaceDocument): Promise<void> {
-    return this.storage.write(document);
+  async save(document: WorkspaceDocument): Promise<void> {
+    try {
+      await this.storage.write(document);
+      this.storage.clearPending();
+      this.storage.clearDirtyIfCovered(maxProjectUpdatedAt(document));
+    } catch (error) {
+      // Keep the unsaved content so the next launch can recover it even though this write failed.
+      this.storage.writePending(document);
+      throw error;
+    }
   }
+
+  saveSync(document: WorkspaceDocument): boolean {
+    const saved = this.storage.writeSync(document);
+    if (saved) {
+      this.storage.clearPending();
+      this.storage.clearDirtyIfCovered(maxProjectUpdatedAt(document));
+    }
+    return saved;
+  }
+
+  markDirty(projectId: string, updatedAt: number): void {
+    this.storage.writeDirty({ projectId, updatedAt });
+  }
+}
+
+export function maxProjectUpdatedAt(document: WorkspaceDocument): number {
+  return document.projects.reduce((latest, project) => Math.max(latest, project.updatedAt), 0);
+}
+
+function newerDocument(a: WorkspaceDocument | null, b: WorkspaceDocument | null): WorkspaceDocument | null {
+  if (!a) return b;
+  if (!b) return a;
+  return maxProjectUpdatedAt(b) > maxProjectUpdatedAt(a) ? b : a;
 }
 
 function decodeWorkspace(value: unknown): WorkspaceDocument | null {
@@ -24,7 +83,9 @@ function decodeWorkspace(value: unknown): WorkspaceDocument | null {
     projects.push(project);
   }
   if (!projects.length || !projects.some((project) => project.id === value.activeProjectId)) return null;
-  return { schemaVersion: 1, projects, activeProjectId: value.activeProjectId };
+  const document: WorkspaceDocument = { schemaVersion: 1, projects, activeProjectId: value.activeProjectId };
+  if (typeof value.savedAt === 'number') document.savedAt = value.savedAt;
+  return document;
 }
 
 function decodeProject(value: unknown): RuleProject | null {

@@ -20,10 +20,25 @@ export default function App() {
   const state = useSyncExternalStore(workspace.subscribe, workspace.getSnapshot, workspace.getSnapshot);
   const project = state.project;
   const activeNavigation = navigation.find((item) => item.id === state.activeModule) ?? navigation[0];
+  const savedAtLabel = state.lastSavedAt
+    ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(state.lastSavedAt)
+    : '';
 
   useEffect(() => {
     void workspace.start();
-    return () => workspace.dispose();
+    const flushPendingSave = () => workspace.flushOnExit();
+    const flushWhenHidden = () => {
+      if (document.visibilityState === 'hidden') workspace.flushOnExit();
+    };
+    window.addEventListener('pagehide', flushPendingSave);
+    window.addEventListener('beforeunload', flushPendingSave);
+    document.addEventListener('visibilitychange', flushWhenHidden);
+    return () => {
+      window.removeEventListener('pagehide', flushPendingSave);
+      window.removeEventListener('beforeunload', flushPendingSave);
+      document.removeEventListener('visibilitychange', flushWhenHidden);
+      workspace.dispose();
+    };
   }, [workspace]);
 
   const openRule = (ruleId: string) => {
@@ -44,10 +59,12 @@ export default function App() {
       </aside>
 
       <main className="main-area">
-        <header className="topbar"><div className="breadcrumb"><span>规则项目</span><b>/</b><strong>{activeNavigation.label}</strong></div><div className="topbar-right"><span className="save-indicator"><i className={state.persistence === 'saving' ? 'save-dot is-saving' : state.persistence === 'error' ? 'save-dot save-error' : 'save-dot'} />{state.persistence === 'saving' ? '保存中' : state.persistence === 'error' ? '保存失败' : '已保存'}</span><span className="topbar-divider" /><button className="avatar-button" aria-label="用户菜单">RW</button></div></header>
+        <header className="topbar"><div className="breadcrumb"><span>规则项目</span><b>/</b><strong>{activeNavigation.label}</strong></div><div className="topbar-right"><span className="save-indicator" title={state.persistence === 'error' ? state.saveError : undefined}><i className={state.persistence === 'saving' ? 'save-dot is-saving' : state.persistence === 'error' ? 'save-dot save-error' : 'save-dot'} />{state.persistence === 'saving' ? '保存中…' : state.persistence === 'error' ? '保存失败' : savedAtLabel ? `已保存 ${savedAtLabel}` : '已保存'}</span><span className="topbar-divider" /><button className="avatar-button" aria-label="用户菜单">RW</button></div></header>
         {project && <div className="content-wrap">
           <div className="project-title-bar"><div className="project-title-copy"><span className="project-kicker">RULE PROJECT / LOCAL</span><input aria-label="项目名称" value={project.title} onChange={(event) => workspace.renameProject(event.target.value)} /><span className="project-subtitle">规则逻辑空间 <span>·</span> 最后修改 {new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(project.updatedAt)}</span></div><div className="title-bar-actions"><span className={`phase-badge phase-${state.phase}`}>{state.phase === 'checking' ? '检查中' : state.phase === 'validating' ? '需要修复' : state.phase === 'error' ? '发生错误' : project.frozenVersionId ? '已冻结' : state.phase === 'ready' ? '检查通过' : '编辑中'}</span><button className="title-more-button" aria-label="创建项目" title="新建项目" onClick={() => workspace.createProject()}>＋</button></div></div>
-          {state.notice && <div className={`status-message${state.phase === 'error' ? ' status-message-error' : ''}`} role="status"><span>{state.phase === 'error' ? '!' : '↳'}</span>{state.notice}{state.saveError && <small>{state.saveError}</small>}</div>}
+          {state.persistence === 'error' && <div className="status-message status-message-error" role="alert"><span>!</span>保存失败，改动尚未写入本地。待写内容已保留，可继续编辑，关闭页面前会自动重试。{state.saveError && <small>{state.saveError}</small>}<button type="button" className="status-action" onClick={() => workspace.retrySave()}>立即重试</button></div>}
+          {state.lostUnsavedChanges && state.persistence !== 'error' && <div className="status-message status-message-error" role="alert"><span>!</span>上次关闭前有改动未能保存，当前显示的是更早保存的版本{savedAtLabel ? `（保存于 ${savedAtLabel}）` : ''}。</div>}
+          {state.notice && <div className={`status-message${state.phase === 'error' ? ' status-message-error' : ''}`} role="status"><span>{state.phase === 'error' ? '!' : '↳'}</span>{state.notice}</div>}
           <div className="module-tabs" role="tablist" aria-label="规则项目功能模块">
             {navigation.map((item, index) => <button id={`module-tab-${item.id}`} key={item.id} role="tab" aria-selected={state.activeModule === item.id} aria-controls="module-panel" tabIndex={state.activeModule === item.id ? 0 : -1} className={`module-tab${state.activeModule === item.id ? ' module-tab-active' : ''}`} onClick={() => workspace.navigate(item.id)} onKeyDown={(event) => {
               if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;

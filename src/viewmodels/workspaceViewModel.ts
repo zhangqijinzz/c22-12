@@ -8,7 +8,7 @@ import type {
   WorkspaceDocument,
 } from '../models/ruleModel';
 import { cloneData, createBlankProject, createDemoWorkspace, createVersionSnapshot, makeId } from '../models/projectFactory';
-import { RuleRepository } from '../repositories/ruleRepository';
+import { maxProjectUpdatedAt, RuleRepository } from '../repositories/ruleRepository';
 import { ProjectStorageService } from '../services/projectStorageService';
 import { RuleCheckService, type CheckOperation } from '../services/ruleCheckService';
 import type { WorkspacePort } from './workspacePort';
@@ -29,10 +29,12 @@ export interface WorkspaceState {
   selectedRuleId?: string;
   notice: string;
   saveError?: string;
+  lastSavedAt?: number;
+  lostUnsavedChanges?: boolean;
 }
 
 type Listener = () => void;
-type WorkspaceRepository = Pick<RuleRepository, 'load' | 'save'>;
+type WorkspaceRepository = Pick<RuleRepository, 'load' | 'save' | 'saveSync' | 'markDirty'>;
 type Checker = Pick<RuleCheckService, 'run'>;
 
 export class RuleWorkspaceViewModel implements WorkspacePort {
@@ -48,6 +50,7 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   private checkOperation?: CheckOperation;
   private checkRevision = 0;
   private saveRevision = 0;
+  private persistedRevision = 0;
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -75,6 +78,30 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
       this.enqueueSave(this.state.workspace, this.saveRevision);
     }
     await this.writeQueue;
+  }
+
+  // Called from pagehide/beforeunload/visibilitychange: anything still waiting on the
+  // debounce timer or an in-flight write must reach durable storage synchronously.
+  flushOnExit(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    const workspace = this.state.workspace;
+    if (!workspace || this.persistedRevision >= this.saveRevision) return;
+    const revision = this.saveRevision;
+    if (this.repository.saveSync(workspace)) {
+      // The synchronous fallback write is durable; still mirror into IndexedDB while
+      // the page is alive. If it cannot finish, the next launch prefers the newer copy.
+      this.persistedRevision = revision;
+    }
+    this.enqueueSave(workspace, revision);
+  }
+
+  retrySave(): void {
+    const workspace = this.state.workspace;
+    if (!workspace || this.state.persistence !== 'error') return;
+    this.scheduleSave(workspace);
   }
 
   dispose(): void {
@@ -217,13 +244,35 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
   private async initialize(): Promise<void> {
     this.publish({ ...this.state, phase: 'loading', notice: '正在恢复本地规则项目…' });
     try {
-      const saved = await this.repository.load();
-      const workspace = saved ?? createDemoWorkspace();
+      const result = await this.repository.load();
+      const workspace = result.document ?? createDemoWorkspace();
       const project = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId) ?? workspace.projects[0];
       const issues = ruleDomain.validateProject(project);
-      this.publish({ ...this.state, workspace, project, phase: issues.length ? 'validating' : 'editing', persistence: saved ? 'saved' : 'saving', activeModule: 'inspection', checkStatus: issues.length ? 'idle' : 'scheduled', validationIssues: issues, analysis: null, sampleEvaluation: evaluateSample(project, project.sampleInputs), selectedRuleId: project.rules[0]?.id, notice: saved ? '已从本地恢复最近项目' : '已载入演示项目，可直接修改并检查规则' });
-      if (saved) this.scheduleCheck(40);
-      else {
+      const notice = result.recoveredPending
+        ? '已恢复上次未能写入本地的改动，正在重新保存…'
+        : result.lostUnsavedChanges
+          ? '上次关闭前有改动未能保存到本地，当前显示的是更早保存的版本'
+          : result.document
+            ? '已从本地恢复最近项目'
+            : '已载入演示项目，可直接修改并检查规则';
+      this.publish({
+        ...this.state, workspace, project,
+        phase: issues.length ? 'validating' : 'editing',
+        persistence: result.document ? 'saved' : 'saving',
+        lastSavedAt: result.document ? workspace.savedAt ?? maxProjectUpdatedAt(workspace) : undefined,
+        lostUnsavedChanges: result.lostUnsavedChanges,
+        activeModule: 'inspection',
+        checkStatus: issues.length ? 'idle' : 'scheduled',
+        validationIssues: issues, analysis: null,
+        sampleEvaluation: evaluateSample(project, project.sampleInputs),
+        selectedRuleId: project.rules[0]?.id,
+        notice,
+      });
+      if (result.document) {
+        // Recovered pending content lives only in the retained slot until it is saved again.
+        if (result.recoveredPending) this.scheduleSave(workspace);
+        this.scheduleCheck(40);
+      } else {
         this.scheduleSave(workspace);
         if (!issues.length) this.scheduleCheck(40);
       }
@@ -279,6 +328,8 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
     const revision = ++this.saveRevision;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.publish({ ...this.state, persistence: 'saving', saveError: undefined });
+    const active = workspace.projects.find((candidate) => candidate.id === workspace.activeProjectId);
+    if (active) this.repository.markDirty(active.id, active.updatedAt);
     this.saveTimer = setTimeout(() => {
       this.saveTimer = undefined;
       this.enqueueSave(workspace, revision);
@@ -287,7 +338,10 @@ export class RuleWorkspaceViewModel implements WorkspacePort {
 
   private enqueueSave(workspace: WorkspaceDocument, revision: number): void {
     this.writeQueue = this.writeQueue.catch(() => undefined).then(() => this.repository.save(workspace)).then(() => {
-      if (revision === this.saveRevision) this.publish({ ...this.state, persistence: 'saved', saveError: undefined });
+      this.persistedRevision = Math.max(this.persistedRevision, revision);
+      if (revision === this.saveRevision) {
+        this.publish({ ...this.state, persistence: 'saved', saveError: undefined, lastSavedAt: Date.now(), lostUnsavedChanges: false });
+      }
     }).catch((error: unknown) => {
       if (revision === this.saveRevision) this.publish({ ...this.state, persistence: 'error', saveError: error instanceof Error ? error.message : '保存失败' });
     });

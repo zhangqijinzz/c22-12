@@ -65,6 +65,7 @@ export interface WorkspaceDocument {
   schemaVersion: 1;
   projects: RuleProject[];
   activeProjectId: string;
+  savedAt?: number;
 }
 
 export interface ValidationIssue {

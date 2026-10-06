@@ -5,8 +5,10 @@ import { SamplesViewModel } from '../features/samples/samplesViewModel';
 import { RuleWorkspaceViewModel } from '../viewmodels/workspaceViewModel';
 
 class MemoryRepository {
-  async load() { return null; }
+  async load() { return { document: null, recoveredPending: false, lostUnsavedChanges: false }; }
   async save() { return undefined; }
+  saveSync() { return true; }
+  markDirty() { return undefined; }
 }
 
 class FakeChecker {
